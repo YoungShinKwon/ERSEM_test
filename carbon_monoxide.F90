@@ -1,0 +1,294 @@
+#include "fabm_driver.h"
+module ersem_carbon_monoxide
+
+! Computes oxygen saturation, apparent oxygen utilization and handles
+! exchange of oxygen across the water surface.
+
+! Note: negative oxygen concentrations are permitted.
+! These reflect an oygen debt (e.g., presence of H2S)
+! In this case, oxygen saturation will be zero (not negative!),
+! while apparent oxygen utilization will still be the difference
+! between saturation concentration and [negative] oxygen concentration.
+! Thus, the oxygen debt is included as part of utilization.
+
+   use fabm_types
+   use ersem_shared
+   
+   implicit none
+
+   private
+
+   type,extends(type_base_model),public :: type_ersem_carbon_monoxide
+!     Variable 
+      type (type_state_variable_id)     :: id_O4c
+      type (type_dependency_id)         :: id_ETW, id_x1X, id_B1c
+      type (type_dependency_id),allocatable         :: id_scalar_band(:)      !id_scalar(:)
+      type (type_state_variable_id)     :: id_R1c, id_R2c, id_R3c, id_O3c
+      type (type_horizontal_dependency_id) :: id_wnd, id_airp, id_PCOA
+      type (type_horizontal_diagnostic_variable_id) ::  id_fair
+      type (type_diagnostic_variable_id) :: id_production,id_consumption
+      
+      
+      ! Parameters
+      real (rk) :: kbio   ! biological mineralisation rate
+      real (rk) :: ag, Rref     ! CDOM absorption coefficient and reference WL
+      real (rk) :: S      ! Exponential slope of CDOM absorbance
+      integer :: nband    ! Number of wave length
+      real (rk),allocatable :: lambda(:)
+   contains
+      procedure :: initialize
+      procedure :: do
+      procedure :: do_surface
+   end type
+
+contains
+
+   subroutine initialize(self,configunit)
+!
+! !INPUT PARAMETERS:
+      class (type_ersem_carbon_monoxide), intent(inout), target :: self
+      integer,                       intent(in)            :: configunit
+      integer :: l
+      real (rk) :: scalar_band            !!Scalar irradiance from spectral model
+      character(len=4) :: index
+!!
+!EOP
+!-----------------------------------------------------------------------
+!BOC
+      call self%get_parameter(self%kbio,'kbio','m^3/mgC/d','biological mineralisation rate specfic per unit of bacteria biomass')
+      call self%get_parameter(self%ag,'ag','1/m','CDOM absporption coefficient')  !  CDOM absorbance at reference WL
+      call self%get_parameter(self%Rref,'Rref','nm','CDOM absporption reference WL')  !  referen WL
+      call self%get_parameter(self%S,'S','','spectral slope')
+      call self%get_parameter(self%nband,'nband','','number of wavebands')
+
+      call self%register_state_variable(self%id_O4c,'c','mmol C/m^3','Carbon monoxide',0.001_rk, minimum=0._rk)
+
+      call self%register_diagnostic_variable(self%id_production,'production','mmol C/m^3/d','production rate')
+      call self%register_diagnostic_variable(self%id_consumption,'consumption','mmol C/m^3/d','consumption rate')
+      call self%register_diagnostic_variable(self%id_fair,'fair','mmol C/m^2/d','air-sea flux', source=source_do_surface)
+
+      call self%register_dependency(self%id_ETW,standard_variables%temperature)
+      call self%register_dependency(self%id_x1X,standard_variables%practical_salinity)
+      call self%register_dependency(self%id_wnd,standard_variables%wind_speed)
+      call self%register_dependency(self%id_airp,standard_variables%surface_air_pressure)
+      call self%register_dependency(self%id_PCOA,mole_fraction_of_carbon_monoxide_in_air)
+      allocate(self%id_scalar_band(self%nband))  !!! added for considering CO production depending on wavelength
+      allocate(self%lambda(self%nband))    !!! same as the line above
+      
+      do l = 1, self%nband     !!! same as the line above
+          write (index, '(i0)') l
+          call self%get_parameter(self%lambda(l),'lambda'//trim(index),'nm','Wave length')
+          call self%register_dependency(self%id_scalar_band(l),'scalar_band'//trim(index),'W/m2/nm','scalar irradiance'//trim(index))
+      end do
+
+      call self%register_dependency(self%id_B1c,'B1c','mg C/m^3','Bacterial carbon')
+      
+      call self%register_state_dependency(self%id_O3c,'O3c','mmol C/m^3','carbon dioxide')
+      call self%register_state_dependency(self%id_R1c,'R1c','mg C/m^3','labile dissolved organic carbon')
+      call self%register_state_dependency(self%id_R2c,'R2c','mg C/m^3','semi-labile dissolved organic carbon')
+      call self%register_state_dependency(self%id_R3c,'R3c','mg C/m^3','semi-refractory dissolved organic carbon')
+      
+      self%dt = 3600._rk*24._rk
+
+   end subroutine
+
+   subroutine do(self,_ARGUMENTS_DO_)
+      class (type_ersem_carbon_monoxide), intent(in) :: self
+      _DECLARE_ARGUMENTS_DO_
+
+      real (rk), parameter:: h=6.62606957e-34_rk    !Planck's constant (J s)
+      real (rk), parameter:: c=299792458_rk       !Light velocity (m/s)  !To calculate a single photon energy, E = hc/l
+      real (rk), parameter:: n=6.02214129e23_rk    !Avogadro number
+      real(rk), parameter :: seconds_to_day = 86400._rk
+      real(rk), parameter :: nm_to_m = 10E-9
+      real(rk), parameter :: mol_to_mmol = 10E-3
+      real(rk)            :: Jco, Mco, O4c, scalar_band
+      real(rk)            :: B1c, R1c, R2c, R3c, doc
+      real(rk)            :: integral
+
+      !!YSK: when using AQY from Kettle, use the discrete values as below as he did not provide a function of wavelngth in his paper
+      !!Other AQY parameterization can be added to J_array calculation 
+      !real(rk), dimension(9):: aqy_array_obs = (/ 0.00,0.000222,0.000288,0.000416,0.000089,0.0000536,0.0000569,0.0000473,0.00 /)!Kettle 2005 at BATS
+      !real(rk), dimension(9):: aqy_w_array_obs = (/ 290, 297,302,313,326,340,355,365,700 /)
+      real(rk), dimension(13):: aqy_array_obs = (/ 0.0000878,0.000156, 0.000073, 0.000068, 0.00001769, 0.0000463, 0.00002, 0.0000189, 0.0000255, 0.0000099, 0.00000679, 0.0000234, 0.0 /)    !!Kettle 2005 at Delaware Bay
+      real(rk), dimension(13):: aqy_w_array_obs = (/ 285, 297, 302, 313, 325, 326, 340, 345, 355, 365, 380, 405,700 /)
+
+      real(rk), dimension(17) :: aqy_array_interp,J_array, w_array !!Photoproduction and wavelength array for integration
+      integer             :: k, l
+ 
+      _LOOP_BEGIN_
+      
+      _GET_ (self%id_O4c, O4c)
+      _GET_ (self%id_B1c, B1c)
+      _GET_ (self%id_R1c, R1c)
+      _GET_ (self%id_R2c, R2c)
+      _GET_ (self%id_R3c, R3c)
+      
+      !get the wavelength
+      do l=1,17   !from 290 to 700 WL
+        w_array(l) = self%lambda(l)
+      end do
+     
+      !calculate interpolation of CDOM 
+      call interp_0d(size(aqy_w_array_obs),aqy_w_array_obs,aqy_array_obs,size(w_array),w_array,aqy_array_interp)
+
+      do l=1,17    !from 290 to 700 WL
+        _GET_(self%id_scalar_band(l),scalar_band)
+        J_array(l) = seconds_to_day * (scalar_band) * ((EXP(-9.688 - 0.0513*(self%lambda(l) - 290)) + EXP(-11.507 - 0.0131*(self%lambda(l) - 290)))) * (self%ag * exp(self%S * (self%lambda(l) - self%Rref))) / ((h*c/self%lambda(l)) * (1/nm_to_m) * n)   !mol/m3/d   !!!AQY from Ziolkowski and Miller (2007) (Gulf of Maine)
+        !J_array(l) = seconds_to_day * (scalar_band) * (self%ag * exp(self%S * (self%lambda(l) - self%Rref))) * (aqy_array_interp(l)) / ((h*c/self%lambda(l)) * (1/nm_to_m) * n)   !mol/m3/d    !!for BATS by Kettle
+        !write(*,*) (self%ag * exp(self%S * (self%lambda(l) - self%Rref)))
+      end do
+
+ 
+      !call integrate(w_array,s_array,integral)
+      call integrate(w_array,J_array,integral)
+
+      !!! photoproduction of CO in nmol/L/day
+      Jco = integral
+      Jco = Jco / mol_to_mmol    !!mmol/m3/d
+      
+      ! consumption rate in mmol/m^3/day 
+      !Mco = self%kbio*B1c*O4c
+      Mco = 0.0626*24*O4c
+      
+      _SET_DIAGNOSTIC_(self%id_production,Jco)
+      _SET_DIAGNOSTIC_(self%id_consumption,Mco)
+      
+      _SET_ODE_ (self%id_O4c, Jco-Mco)
+      _SET_ODE_ (self%id_O3c, Mco)
+      
+      doc=R1c+R2c+R3c
+      _SET_ODE_ (self%id_R1c, -Jco*CMass*R1c/doc)
+      _SET_ODE_ (self%id_R2c, -Jco*CMass*R2c/doc)
+      _SET_ODE_ (self%id_R3c, -Jco*CMass*R3c/doc)
+      
+      
+      _LOOP_END_
+
+   end subroutine
+
+   subroutine do_surface(self,_ARGUMENTS_DO_SURFACE_)
+      class (type_ersem_carbon_monoxide), intent(in) :: self
+      _DECLARE_ARGUMENTS_DO_SURFACE_
+
+      real(rk) :: O4c,ETW,X1X,wnd
+      real(rk) :: O4SAT,fwind,sc, pcoa, airp,fairCO
+      real(rk), parameter :: Pa_to_atm=9.8692E-6_rk
+      
+      _HORIZONTAL_LOOP_BEGIN_
+         _GET_(self%id_O4c,O4c)
+         _GET_(self%id_ETW,ETW)
+         _GET_(self%id_x1X,x1X)
+         _GET_HORIZONTAL_(self%id_wnd,wnd)
+         _GET_HORIZONTAL_(self%id_pcoa,pcoa)
+         _GET_HORIZONTAL_(self%id_airp,airp)
+         
+         O4SAT = CO_saturation_concentration(self,ETW,X1X)
+
+         if (wnd.lt.0._rk) wnd=0._rk
+
+         
+         sc = 2.237124e3_rk - 1.594439e2_rk*ETW + 5.70687_rk*ETW**2 -1.092382e-1_rk*ETW**3 + 8.643478e-4_rk*ETW**4 + x1X*(5.688195_rk - 3.491560e-1_rk*ETW + 1.123795e-2_rk*ETW**2 - 2.011444e-4_rk*ETW**3 + 1.528927e-6_rk*ETW**4)
+         
+         fwind =  (0.222_rk *wnd**2.0_rk + 0.333_rk * wnd)*(sc/600._rk)**(-0.5_rk)
+         fwind=fwind*24._rk/100._rk   ! convert to m/day
+         
+         !!! flux calculated converting atmospheric ppb to mmol/m^3
+         fairCO = fwind * (O4sat*pcoa*airp*Pa_to_atm-O4c) 
+
+         _SET_SURFACE_EXCHANGE_(self%id_O4c,fairCO)
+         _SET_HORIZONTAL_DIAGNOSTIC_(self%id_fair,fairCO)
+         
+      _HORIZONTAL_LOOP_END_
+   end subroutine
+
+   function CO_saturation_concentration(self,ETW,X1X) result(O4SAT)
+      class (type_ersem_carbon_monoxide), intent(in) :: self
+      real(rk),                      intent(in) :: ETW,X1X
+      real(rk)                                  :: O4SAT
+      real(rk)                                  :: airp,pcoa
+
+!     real(rk),parameter :: A1 = -47.6148_rk
+!     real(rk),parameter :: A2 = 69.5068_rk
+!     real(rk),parameter :: A3 = 18.7397_rk
+!     real(rk),parameter :: A4 = 0._rk
+!     real(rk),parameter :: B1 = 0.045657_rk
+!     real(rk),parameter :: B2 = -0.040721_rk
+!     real(rk),parameter :: B3 = 0.007970_rk
+!     real(rk),parameter :: R = 8.3145_rk
+!     real(rk),parameter :: P = 101325_rk
+!     real(rk),parameter :: T = 273.15_rk      
+      real(rk),parameter :: A1 = -172.6048_rk
+      real(rk),parameter :: A2 = 263.5657_rk
+      real(rk),parameter :: A3 = 159.2552_rk
+      real(rk),parameter :: A4 = -25.4967_rk
+      real(rk),parameter :: B1 = .051198_rk
+      real(rk),parameter :: B2 = -.044591_rk
+      real(rk),parameter :: B3 = .0086462_rk
+      real(rk),parameter :: R = 8.3145_rk
+      real(rk),parameter :: P = 101325_rk
+      real(rk),parameter :: T = 273.15_rk
+     !volume of an ideal gas at standard temp (25C) and pressure (1 atm)
+      real(rk),parameter :: VIDEAL = 22.4_rk
+
+      real(rk)           :: ABT
+
+      !_GET_HORIZONTAL_(self%id_pcoa,pcoa)
+      !_GET_HORIZONTAL_(self%id_airp,airp)
+
+      ! calc absolute temperature
+      ABT = ETW + T
+
+      ! calc theoretical CO saturation for temp + salinity
+      O4SAT = A1 + A2 * (100._rk/ABT) + A3 * log(ABT/100._rk) &
+                  + A4 * (ABT/100._rk) &
+                  + X1X * ( B1 + B2 * (ABT/100._rk) + B3 * ((ABT/100._rk)**2))
+
+
+      ! units nmol/l = umol/m3
+      O4SAT = exp( O4SAT ) * pcoa * 1.e-9_rk
+      
+      ! converting to mmol/m3
+      !O4SAT = O4SAT / VIDEAL
+      O4SAT = O4SAT / 1000._rk 
+     
+   end function
+
+
+   subroutine interp_0d(nsource,x,y,ntarget,targetx,targety)
+      ! 1D interpolation, extrapolates beyond boundaries
+      integer,                    intent(in)  :: nsource,ntarget
+      real(rk),dimension(nsource),intent(in)  :: x,y
+      real(rk),dimension(ntarget),intent(in)  :: targetx
+      real(rk),dimension(ntarget),intent(out) :: targety
+      integer :: i,j
+      real(rk) :: frac
+
+      i = 1
+      do j = 1,ntarget
+         do while (i+1<nsource)
+            if (x(i+1)>=targetx(j)) exit
+            i = i+1
+         end do
+         frac = (targetx(j)-x(i))/(x(i+1)-x(i))
+         targety(j) = y(i) + frac*(y(i+1)-y(i))
+      end do
+   end subroutine
+
+
+   subroutine integrate(x, y, r)
+    !! Calculates the integral of an array y with respect to x using the trapezoid
+    !! approximation. Note that the mesh spacing of x does not have to be uniform.
+    real(rk), intent(in) :: x(:)        !! Variable x
+    real(rk), intent(in) :: y(size(x)) !! Function y(x)
+    real(rk), intent(out) :: r     !! Integral ∫y(x)·dx
+
+    ! Integrate using the trapezoidal rule
+    associate(n => size(x))
+      r = sum((y(1+1:n-0) + y(1+0:n-1))*(x(1+1:n-0) - x(1+0:n-1)))/2
+    end associate
+
+   end subroutine
+
+
+end module

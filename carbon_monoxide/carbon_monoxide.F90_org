@@ -1,0 +1,233 @@
+#include "fabm_driver.h"
+module ersem_carbon_monoxide
+
+! Computes oxygen saturation, apparent oxygen utilization and handles
+! exchange of oxygen across the water surface.
+
+! Note: negative oxygen concentrations are permitted.
+! These reflect an oygen debt (e.g., presence of H2S)
+! In this case, oxygen saturation will be zero (not negative!),
+! while apparent oxygen utilization will still be the difference
+! between saturation concentration and [negative] oxygen concentration.
+! Thus, the oxygen debt is included as part of utilization.
+
+   use fabm_types
+   use ersem_shared
+   
+   implicit none
+
+   private
+
+   type,extends(type_base_model),public :: type_ersem_carbon_monoxide
+!     Variable 
+      type (type_state_variable_id)     :: id_O4c
+      type (type_dependency_id)         :: id_EIR,id_ETW, id_x1X, id_B1c
+      type (type_dependency_id),allocatable         :: id_scalar(:)
+      type (type_state_variable_id)     :: id_R1c, id_R2c, id_R3c, id_O3c
+      type (type_horizontal_dependency_id) :: id_wnd, id_airp, id_PCOA
+
+      type (type_horizontal_diagnostic_variable_id) ::  id_fair
+      type (type_diagnostic_variable_id) :: id_production,id_consumption
+      
+      
+      ! Parameters
+      real (rk) :: kbio   ! biological mineralisation rate
+      real (rk) :: ag     ! CDOM absorption coefficient
+      real (rk) :: S      ! ?????
+      real (rk) :: aqyAve ! average quantum yield
+      integer :: nband
+      real (rk),allocatable :: lambda(:)
+   contains
+      procedure :: initialize
+      procedure :: do
+      procedure :: do_surface
+   end type
+
+contains
+
+   subroutine initialize(self,configunit)
+!
+! !INPUT PARAMETERS:
+      class (type_ersem_carbon_monoxide), intent(inout), target :: self
+      integer,                       intent(in)            :: configunit
+      integer :: l
+      real (rk) :: scalar
+      character(len=4) :: index
+!!
+!EOP
+!-----------------------------------------------------------------------
+!BOC
+      call self%get_parameter(self%kbio,'kbio','m^3/mgC/d','biological mineralisation rate specfic per unit of bacteria biomass')
+      call self%get_parameter(self%ag,'ag','1/m','CDOM absporption coefficient')  ! average ?
+      call self%get_parameter(self%S,'S','','spectral slope')
+      call self%get_parameter(self%aqyAve,'aqyAve','','average Quantum Yield',default=1.02617e-5_rk)
+      call self%get_parameter(self%nband,'nband','','number of wavebands')
+
+      call self%register_state_variable(self%id_O4c,'c','mmol C/m^3','Carbon monoxide',0.001_rk, minimum=0._rk)
+
+      call self%register_diagnostic_variable(self%id_production,'production','mmol C/m^3/d','production rate')
+      call self%register_diagnostic_variable(self%id_consumption,'consumption','mmol C/m^3/d','consumption rate')
+      call self%register_diagnostic_variable(self%id_fair,'fair','mmol C/m^2/d','air-sea flux', source=source_do_surface)
+
+      call self%register_dependency(self%id_ETW,standard_variables%temperature)
+      call self%register_dependency(self%id_EIR,standard_variables%downwelling_shortwave_flux)
+      call self%register_dependency(self%id_x1X,standard_variables%practical_salinity)
+      call self%register_dependency(self%id_wnd,standard_variables%wind_speed)
+      call self%register_dependency(self%id_airp,standard_variables%surface_air_pressure)
+      call self%register_dependency(self%id_PCOA,mole_fraction_of_carbon_monoxide_in_air)
+      allocate(self%id_scalar(self%nband))  !!! added for considering CO production depending on wavelength
+      allocate(self%lambda(self%nband))    !!! same as the line above
+      do l = 1, self%nband     !!! same as the line above
+          write (index, '(i0)') l
+          call self%get_parameter(self%lambda(l),'lambda'//trim(index),'nm','Wave length')
+          call self%register_dependency(self%id_scalar(l),'scalar_band'//trim(index),'W/m2/nm','scalar irradiance'//trim(index))
+      end do
+
+      call self%register_dependency(self%id_B1c,'B1c','mg C/m^3','Bacterial carbon')
+      
+      call self%register_state_dependency(self%id_O3c,'O3c','mmol C/m^3','carbon dioxide')
+      call self%register_state_dependency(self%id_R1c,'R1c','mg C/m^3','labile dissolved organic carbon')
+      call self%register_state_dependency(self%id_R2c,'R2c','mg C/m^3','semi-labile dissolved organic carbon')
+      call self%register_state_dependency(self%id_R3c,'R3c','mg C/m^3','semi-refractory dissolved organic carbon')
+      
+      self%dt = 3600._rk*24._rk
+
+   end subroutine
+
+   subroutine do(self,_ARGUMENTS_DO_)
+      class (type_ersem_carbon_monoxide), intent(in) :: self
+      _DECLARE_ARGUMENTS_DO_
+
+      real(rk), parameter :: x1=290._rk  ! lower end of the wavelength spectrum
+      real(rk), parameter :: x2=800._rk  ! higher end of the wavelength spectrum
+      real(rk), parameter :: dx=1._rk    ! incremental for integration over wavelength spectrum
+      real(rk), parameter :: EIR_to_SWR = 0.51_rk  ! conversion from EIR to Short Wave Radiation
+      real (rk), parameter::EAve = 4.013188724E-18*(6.02e23)     !photon average energy of a photon (Einstein) (from 280 to 800 nm WL)
+      real(rk), parameter :: seconds_to_day = 86400._rk
+      real(rk)            :: val, cdomAve, x, Jco, EIR, Mco, O4c, scalar
+      real(rk)            :: B1c, R1c, R2c, R3c, doc
+      integer             :: k, l
+      
+      _LOOP_BEGIN_
+      
+      _GET_ (self%id_EIR, EIR)
+      _GET_ (self%id_O4c, O4c)
+      _GET_ (self%id_B1c, B1c)
+      _GET_ (self%id_R1c, R1c)
+      _GET_ (self%id_R2c, R2c)
+      _GET_ (self%id_R3c, R3c)
+            
+      val=0._rk
+      x=x1
+      do k = 1,530
+         x  = x + dx
+       !val = val +  (ag(i) * exp(S * (x - 300))) * dx    !BATS
+       val = val + (self%ag * exp(self%S * (x - 412))) * dx   !NPacific
+       if (x .gt. x2) exit
+      enddo
+      
+      cdomAve= val/(x2-x1)   ! average CDOM absporption coefficient
+     
+      !self%lambda(l),
+       _GET_(self%id_scalar(l),scalar)
+      !integral = 0
+      !do l=1,self%nlambda
+      !  integral = integral + QY(l)*abs(l)*scalar
+      !end do
+ 
+      !!! photoproduction of CO in nmol/L/day
+      Jco = EIR*EIR_to_SWR*cdomAve*self%aqyAve*seconds_to_day*10**9/EAve/1000._rk
+      ! conversion in mmol/m3/d
+      Jco=Jco/1000.
+      
+      ! consumption rate in mmol/m^3/day 
+      Mco = self%kbio*B1c*O4c
+      
+      _SET_DIAGNOSTIC_(self%id_production,Jco)
+      _SET_DIAGNOSTIC_(self%id_consumption,Mco)
+      
+      _SET_ODE_ (self%id_O4c, Jco-Mco)
+      _SET_ODE_ (self%id_O3c, Mco)
+      
+      doc=R1c+R2c+R3c
+      _SET_ODE_ (self%id_R1c, -Jco*CMass*R1c/doc)
+      _SET_ODE_ (self%id_R2c, -Jco*CMass*R2c/doc)
+      _SET_ODE_ (self%id_R3c, -Jco*CMass*R3c/doc)
+      
+      
+      _LOOP_END_
+   end subroutine
+
+   subroutine do_surface(self,_ARGUMENTS_DO_SURFACE_)
+      class (type_ersem_carbon_monoxide), intent(in) :: self
+      _DECLARE_ARGUMENTS_DO_SURFACE_
+
+      real(rk) :: O4c,ETW,X1X,wnd
+      real(rk) :: O4SAT,fwind,sc, pcoa, airp,fairCO
+      real(rk), parameter :: Pa_to_atm=9.8692E-6_rk
+      
+      _HORIZONTAL_LOOP_BEGIN_
+         _GET_(self%id_O4c,O4c)
+         _GET_(self%id_ETW,ETW)
+         _GET_(self%id_x1X,x1X)
+         _GET_HORIZONTAL_(self%id_wnd,wnd)
+         _GET_HORIZONTAL_(self%id_pcoa,pcoa)
+         _GET_HORIZONTAL_(self%id_airp,airp)
+         
+         O4SAT = CO_saturation_concentration(self,ETW,X1X)
+
+         if (wnd.lt.0._rk) wnd=0._rk
+
+         
+         sc = 2.237124e3_rk - 1.594439e2_rk*ETW + 5.70687_rk*ETW**2 -1.092382e-1_rk*ETW**3 + 8.643478e-4_rk*ETW**4 + x1X*(5.688195_rk - 3.491560e-1_rk*ETW + 1.123795e-2_rk*ETW**2 - 2.011444e-4_rk*ETW**3 + 1.528927e-6_rk*ETW**4)
+         
+         fwind =  (0.222_rk *wnd**2.0_rk + 0.333_rk * wnd)*(sc/600._rk)**(-0.5_rk)
+         fwind=fwind*24._rk/100._rk   ! convert to m/day
+         
+         !!! flux calculated converting atmospheric ppb to mmol/m^3
+         fairCO = fwind * (O4sat*pcoa*airp*Pa_to_atm-O4c) 
+
+         _SET_SURFACE_EXCHANGE_(self%id_O4c,fairCO)
+         _SET_HORIZONTAL_DIAGNOSTIC_(self%id_fair,fairCO)
+         
+      _HORIZONTAL_LOOP_END_
+   end subroutine
+
+      function CO_saturation_concentration(self,ETW,X1X) result(O4SAT)
+      class (type_ersem_carbon_monoxide), intent(in) :: self
+      real(rk),                      intent(in) :: ETW,X1X
+      real(rk)                                  :: O4SAT
+
+      real(rk),parameter :: A1 = -47.6148_rk
+      real(rk),parameter :: A2 = 69.5068_rk
+      real(rk),parameter :: A3 = 18.7397_rk
+      real(rk),parameter :: A4 = 0._rk
+      real(rk),parameter :: B1 = 0.045657_rk
+      real(rk),parameter :: B2 = -0.040721_rk
+      real(rk),parameter :: B3 = 0.007970_rk
+      real(rk),parameter :: R = 8.3145_rk
+      real(rk),parameter :: P = 101325_rk
+      real(rk),parameter :: T = 273.15_rk
+
+      ! volume of an ideal gas at standard temp (25C) and pressure (1 atm)
+      real(rk),parameter :: VIDEAL = 22.4_rk
+
+      real(rk)           :: ABT
+
+      ! calc absolute temperature
+      ABT = ETW + T
+
+      ! calc theoretical CO saturation for temp + salinity
+      O4SAT = A1 + A2 * (100._rk/ABT) + A3 * log(ABT/100._rk) &
+                  + A4 * (ABT/100._rk) &
+                  + X1X * ( B1 + B2 * (ABT/100._rk) + B3 * ((ABT/100._rk)**2))
+
+      ! units nmol/l/atm (STP)
+      O4SAT = exp( O4SAT )
+      
+      ! converting to mmol/m3/atm
+      O4SAT = O4SAT / 1000._rk / VIDEAL
+
+   end function
+
+end module
